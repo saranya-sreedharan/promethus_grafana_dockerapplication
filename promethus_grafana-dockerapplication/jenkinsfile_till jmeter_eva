@@ -1,0 +1,183 @@
+pipeline {
+    agent any
+    
+    environment {
+        JMETER_HOME = '/opt/apache-jmeter-5.6.3'
+        PATH = "${JMETER_HOME}/bin:${env.PATH}"
+    }
+
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    try {
+                        // Checkout the git repository
+                        git branch: 'main', credentialsId: 'gitlab-login', url: 'https://gitlab.com/practice-group9221502/cicd-project.git'
+                    } catch (Exception e) {
+                        echo "Error during checkout: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error("Stopping pipeline due to checkout failure")
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    try {
+                        // Perform SonarQube analysis
+                        withCredentials([string(credentialsId: 'sonar_qube_token', variable: 'SONAR_TOKEN')]) {
+                            sh '''
+                                /opt/sonar-scanner-5.0.1.3006-linux/bin/sonar-scanner \
+                                -Dsonar.projectKey=cicd-project \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url=http://10.18.22.18:9001/ \
+                                -Dsonar.login=$SONAR_TOKEN
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "Error during SonarQube analysis: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error("Stopping pipeline due to SonarQube analysis failure")
+                    }
+                }
+            }
+        }
+
+        stage('Containerizing PHP Application') {
+            steps {
+                script {
+                    try {
+                        // Build Docker image for PHP application
+                        echo 'Building Docker image for PHP application...'
+                        sh 'sudo docker build -t docker.mnserviceproviders.com/php_hellow:v1 .'
+                    } catch (Exception e) {
+                        echo "Error during Docker build: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error("Stopping pipeline due to Docker build failure")
+                    }
+                }
+            }
+        }
+
+        stage('Run API Tests') {
+            steps {
+                script {
+                    // Run Newman command and generate the report
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        sh 'newman run /var/jenkins_home/workspace/$JOB_NAME/mmdev2api.postman_collection__1_.json -r htmlextra'
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        try {
+                            // Move HTML report to a temporary location
+                            sh 'cp /var/jenkins_home/workspace/cicd-project/newman/*.html /tmp/'
+
+                            // Store HTML reports into PostgreSQL database
+                            def htmlReportsDir = "/tmp/"
+                            def htmlReports = sh(script: 'ls /tmp/*.html', returnStdout: true).trim().split('\n')
+
+                            htmlReports.each { reportFile ->
+                                // Extract report name from file path
+                                def reportName = reportFile.tokenize('/').last()
+
+                                // Read HTML report content
+                                def reportContent = readFile(file: reportFile).trim()
+
+                                // Store report content into PostgreSQL database
+                                storeReportInDatabase(reportName, reportContent)
+                            }
+                        } catch (Exception e) {
+                            echo "Error during API tests post-processing: ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Verify JMeter Version') {
+            steps {
+                script {
+                    sh "jmeter -v"
+                }
+            }
+        }
+
+        stage('Run JMeter Tests') {
+            steps {
+                script {
+                    try {
+                        // Create directories for JMeter results
+                        sh '''
+                            mkdir -p /var/jenkins_home/workspace/cicd-project/jmeter_folder/csv
+                            mkdir -p /var/jenkins_home/workspace/cicd-project/jmeter_folder/html
+                        '''
+
+                        // Run JMeter tests and generate dashboard report
+                        sh '''
+                           jmeter -n -t /var/jenkins_home/workspace/cicd-project/wikipedia.jmx -l /var/jenkins_home/workspace/cicd-project/jmeter_folder/csv/wikipedia.csv  -e  -o /var/jenkins_home/workspace/cicd-project/jmeter_folder/html/wikipedia
+                        '''
+                    } catch (Exception e) {
+                        echo "Error during JMeter tests: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error("Stopping pipeline due to JMeter test failure")
+                    }
+                }
+            }
+        }
+
+        stage('Convert and Transfer Script') {
+            steps {
+                script {
+                    try {
+                        // Convert and transfer bash script to target machine
+                        withCredentials([sshUserPrivateKey(credentialsId: 'ssh-credential-id', keyFileVariable: 'SSH_KEY_FILE'),
+                                         usernamePassword(credentialsId: 'docker-repo-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                            def bashScript = "/var/jenkins_home/workspace/${env.JOB_NAME}/deployment_testserver.sh"
+                            def apiFolder = "/var/jenkins_home/workspace/${env.JOB_NAME}/newman"
+
+                            // Convert line endings to Unix format using dos2unix on Jenkins machine
+                            sh "dos2unix ${bashScript}"
+
+                            // Transfer script and folder to target machine
+                            sh """
+                                scp -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no ${bashScript} development@10.18.22.18:/home/development/
+                                rsync -avz -e "ssh -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no" ${apiFolder} development@10.18.22.18:/home/development/
+                            """
+
+                            // Set executable permissions on the script
+                            sh "ssh -i ${SSH_KEY_FILE} development@10.18.22.18 'chmod +x /home/development/deployment_testserver.sh'"
+
+                            // Execute bash script on target machine with environment variables
+                            sh "ssh -i ${SSH_KEY_FILE} development@10.18.22.18 'DOCKER_USER=${DOCKER_USER} DOCKER_PASS=${DOCKER_PASS} bash /home/development/deployment_testserver.sh'"
+                        }
+                    } catch (Exception e) {
+                        echo "Error during script transfer or execution: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        error("Stopping pipeline due to failure in script transfer or execution.")
+                    }
+                }
+            }
+        }
+    }
+}
+
+def storeReportInDatabase(reportName, reportContent) {
+    def dbUrl = "jdbc:postgresql://api-test-sonar_db-1:5432/api_test_reports"
+    def dbUser = "sonar"
+    def dbPassword = "sonar"
+    def driver = 'org.postgresql.Driver'
+
+    Class.forName(driver)
+
+    // Establish database connection
+    def sql = groovy.sql.Sql.newInstance(dbUrl, dbUser, dbPassword, driver)
+
+    // Insert report into database
+    sql.execute("INSERT INTO reports (name, content) VALUES (?, ?)", [reportName, reportContent])
+}
